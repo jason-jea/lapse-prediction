@@ -1,0 +1,9 @@
+name: Lapse_Prediction
+account: rmn-us-ba
+server: shinyapps.io
+appId: 63265
+bundleId: 288002
+url: https://rmn-us-ba.shinyapps.io/Lapse_Prediction
+when: 1444857164.57519
+asMultiple: FALSE
+asStatic: FALSE

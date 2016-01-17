@@ -1,0 +1,264 @@
+---
+title: "Survival Analysis"
+author: "Jason Jea"
+date: "October 4, 2015"
+output: pdf_document
+---
+
+This is a guide for fitting a survival model to RMN app user data.  Ideally, this will allow multiple people to tackle app lapse from many different angles.  
+
+<br>
+At a high level, survival analysis attempts to estimate $P(T > t | X)$ where T is the time of of death and X is a vector of covariates.
+
+For the case of RMN native app analysis, our T is the time of lapse after join, and our X vector can be any collection of characteristics and actions our users have taken.
+
+One of the most commonly used survival models is the Cox-Proportional Hazards model.  It allows us to estimate the multiplicative effects of covariates on the hazard ratio (the probability of death at any unit time).
+
+<br>
+I've decided to look at visit and outclick activity on the app for the first 28 days of lifecycle, and how that affects the survival curves for our userbase.
+
+<br>
+First to set up your R session:
+
+```{r, message=FALSE}
+library(survival)
+library(ggplot2)
+library(plyr)
+library(dplyr)
+library(reshape2)
+library(RPostgreSQL)
+library(tidyr)
+library(lubridate)
+library(scales)
+```
+
+The **survival** package contains the main analysis toolsets we plan on using.  It allows us to easily estimate survival curves and multiplicate coefficients for our covariates.  **RPostgreSQL** allows us to connect directly to any Redshift database.  These are the only two necessary packages.  However, **plyr**, **dplyr**, **reshape2**, **tidyr**, and **lubridate** make the data cleaning and manipulation much easier, and **ggplot2** allows us much greater flexibility when it comes to visualization.
+
+I've outlined how to set up your data connections [in this wiki page](https://wiki.rmn.com/display/WSMBI/Setting+Up+Data+Connections+in+R)
+
+<br>
+I like to have some semblance of structured data already created in my Redshift datamart (let's let databases do what they do best).
+In this case, my dataset is a table of app users with their first visit date, their last visit date, if they have lapsed or not, and then the page type and event type with the associate counts.
+
+```{r, echo=FALSE, include=FALSE, cache=FALSE}
+drv <- dbDriver("PostgreSQL")
+
+redshift = dbConnect(drv,host = 'rsh-rpt-se1-dat-rdb-mem-prd.c2vtvr6b5gso.us-east-1.redshift.amazonaws.com', dbname = 'members',user = "rmn_jjea", password = "182493Superman.",port='5439')
+```
+
+```{r}
+dbGetQuery(redshift, "select * from bi_work.jj_app_lapse_predictions limit 5;")
+```
+
+The data in that table has been exploded out so that each unique pagetype and eventype combination will occupy a row for each user.  We want to pivot this data so that each of those combinations becomes a column.  This will be necessary in order to feed the data into any sort of model.
+<br><br>
+In order words we want:
+```{r, echo = FALSE, include = FALSE, cache = FALSE}
+test <- data.frame(udid = c("abc","abc","abc"),pagetype = c("coverflow","nearby","mall"), eventtype = c("pageview","pageview","outclick"), counts = c(1,4,3))
+```
+```{r, echo = FALSE}
+test
+```
+<br>
+to become:
+```{r, echo = FALSE, message = FALSE}
+test %>% dcast(udid~pagetype + eventtype, fun.aggregate = mean, value.var = "counts")
+```
+<br>
+To do this, we can use the very useful "Hadley-verse" packages: **dplyr**, **plyr**, **reshape2**, and **tidyr**.  
+
+One of my favorite pairs of functions from the **reshape2** package are the melt() and dcast() functions.  In order to massage our data to look like the table above, we need to use dcast() function, which will essentially pivot your data.
+
+```
+dcast(data = test, udid ~ pagetype + eventtype, value.var = "counts")
+```
+
+The main arguments dcast() accepts is a dataframe, a formula that represents how you want to "cast" your data, and the name of the column which stores the values you want to pivot.  You can also pass dcast() a aggregation function if the combination of your columns isn't distinct.  The columns before the ~ are the columns you want to group by.  Every distinct combination of values in the columns after the ~ will become a new column column name, and the cell values will become whatever you specified in the value.var argument.
+
+<br>
+The SQL equivalent of this would be:
+
+```
+select udid
+, max(case when pagetype = 'coverflow' and eventtype = 'pageview' then counts else null end) as coverflow_pageview
+, max(case when pagetype = 'mall' and eventtype = 'outclick' then counts else null end) as mall_outclick
+, max(case when pagetype = 'nearby' and eventtype = 'pageview' then counts else null end) as nearby_pageview
+from test
+group by 1
+```
+
+<br>
+If we wanted to collapse our dataframe similar to what it was previously, we can use melt().  
+
+```{r}
+test <- dcast(data = test, udid ~ pagetype + eventtype, value.var = "counts") 
+melt(data = test, id.vars = c("udid"))
+```
+
+<br>
+Let's go back to our analysis data and perform the same operations such that each distinct event and page type gets transformed as a column name, with the associate counts as the cell values.
+```{r, message = FALSE}
+data <- dbGetQuery(redshift, "select * from bi_work.jj_app_lapse_predictions limit 10000;")
+data <-
+  dcast(data = data, udid + lastvisitdate + firstvisitdate ~ pagetype + eventtype, value.var = "count") 
+colnames(data)
+```
+
+<br>
+One thing that dcast() does is if a particular udid doesn't have a pagetype + eventtype combination, it sets the cell value to NA.  We want to replace all NA's with 0, which is very easy using the is.na() function.  is.na() will take a vector *or* dataframe and return the same vector or dataframe with TRUE or FALSE values.
+
+```{r, message = FALSE}
+data[is.na(data)] <- 0
+```
+
+<br>
+Our data is getting closer to being suitable for survival analysis.  There are a few things left that we want to do.  First, the **survival** package requires an event variable, usually specifying if a death happened.  It also requires an interval variable, which is either the time until death, or the time until the last observation was taking (in the case of right censored data).  
+<br>
+The analogous definitions for RMN app users is pretty straightforward.  We want a variable that represents if a user is lapsed or still active, and then another variable that represents his lifespan.
+```{r, message = FALSE}
+data$lapsed = 1
+data[data$lastvisitdate >= as.Date("2015-09-02"),]$lapsed <- 0
+data <-
+  mutate(data, intervalend = ifelse(lapsed == 1, as.numeric(lastvisitdate - firstvisitdate) + 1,
+                               as.numeric(as.Date("2015-10-01") - firstvisitdate) + 1))
+```
+To create the lapsed column, we use traditional R bracket notation. However to create the interval column, We make use of the **dplyr** package here and its mutate() function.  Creating new columns off of calculations in R can be cumbersome, but mutate allows us to cleanly assign any number of new variables to a dataframe.
+
+<br>
+There is one final thing that we can do that will make modeling easier.  There are 21 potential covariates that we can use in our model.  However, some of these covariates aren't actually real and were only artificially created when we used dcast() on our dataframe.  I wrote a function that takes in a dataframe, identifies variables where every single record is 0, and then filters out those columns.  
+```{r, message = FALSE, echo = FALSE, cache = FALSE}
+filterGoodVariables <-
+  function(data) {
+    goodColumns <-
+      data %>% 
+      colwise(sum)(.) %>% 
+      melt(data=.) %>%
+      filter(value!=0) %>%
+      select(variable)
+    
+    return(data[,goodColumns[,1]])
+  }
+```
+```{r, message = FALSE}
+cleandata <-
+  cbind(filterGoodVariables(data[,c(4:25)]), intervalend = data$intervalend, lapsed = data$lapsed)
+colnames(cleandata)
+```
+<br>
+Our final dataframe will have all the covariates that we want to use in the model, in addition to the lapsed and intervalend variables.
+
+<br>
+All of this work so far was into cleaning our dataset in prepartion for the modeling.  Next, we can actually estimate our native app survival curves and also the proportional effect of our covariates on the hazard ratio.  For those familiar with regression modeling in R, the **Cox-Proportional Hazards** model is specified in a very similar fashion.  The only difference is that, whereas in a typical regression model the response variable only takes in one column name as a paramter, the CoxPH model takes in a **Surv** object.  A **Surv** object is defined by two parameters: first the interval variable, and then the event variable.  The independent variables are specified in the exact same fashion.
+
+```{r}
+model1 <- coxph(Surv(cleandata$intervalend, cleandata$lapsed) ~ .,
+                      data = cleandata[,1:22])
+```
+
+The warning message is most commonly generated if we have certain variables that all have the exact same value.  Fortunately, the cleaning we did earlier takes care of that, so we can ignore the warning.
+
+<br>
+
+We can take a look at the summary of the model in order to get a better idea of coefficients, significance levels, and confidence intervals.  The coefficients are interpretated like any other multiplicative model i.e. logistic regression, and are the relative effects on the **hazard ratio**, or more specifically, the risk of lapsing.
+
+```{r}
+summary(model1)
+```
+
+<br>
+We can see for example, that the more mall pageviews a user has in his first 28 days, all other things held constant, the lower the risk is of lapsing.  
+<br>
+
+Of highest interest to everyone, of course, are the actual survival curves.  The **survival** library allows us to estimate survival curves.  The default curve generated is the base survival curve for the average user, but we'll see later that it's very easy to visualize the effects of certain covariates by fitting newly generated artifical datasets.
+```{r, message = FALSE}
+survivalfit = survfit(model1)
+
+data.frame(cbind(time = survivalfit[[2]], survivalrate = survivalfit[[6]])) %>%
+ggplot(aes(x=time,y=survivalrate))+geom_line() + 
+  theme_bw() + scale_x_continuous(name = "Days after First Launch") + scale_y_continuous(labels = percent, name = "Survival Probability") 
+```
+
+The **survfit** object contains a number of attributes, the most important being the survival probabilites at each unit time.  We can extract out that curve and plot it using **ggplot2**.
+<br>
+
+In order to visualize the effects of covariates on the survival curve, the **survival** package allows us to generate multiple curves based on a dataframe passed as a parameter.  The columns of the dataframe need to match the covariates of the model, and each row will generate a different curve.  What we can do then, is generate a dataframe that has the average values of each covariate.  In order the compare the effect of two covariates, we need to have row where covariate **A** = 0 and covariate **B** = 1, and then another row where A = 1 and B = 1.  This can be generalized to compare many different covariates.  Additionally, you can also look at the effect of an increase in X units of one covariate in a similar method.  
+
+<br>
+I wrote two functions: 
+  **oneVarSurvData()** automatically generates the survival curves of **n** different values of one covariate.
+  **compareVarSurvData()** automatically generates the survival curves of **n** different covariates, given one value to compare between.
+```{r, message = FALSE}
+oneVarSurvData <- function(model, data, metric, values) {
+  avgdata <- colwise(mean)(data)
+  avgdata <- avgdata[,names(avgdata) != metric]
+  
+  finaldata <-
+    data.frame(avgdata[rep(seq_len(nrow(avgdata)),length(values)),], 
+               newcol = values)
+  
+  names(finaldata)[names(finaldata) == "newcol"] <- metric
+  
+  fit <- survfit(model, newdata = finaldata)
+  
+  plot.data <-
+    data.frame(cbind(time = fit[[2]], survivalrate = fit[[6]]))
+  
+  names(plot.data)[1:length(values) + 1] <- paste(values, metric, sep = " ")
+  
+  plot.data <- 
+    plot.data %>% melt("time") %>% dcast(time~variable)
+  
+  return(plot.data)
+  
+}
+
+compareVarSurvData <- function(model, data, metrics, value) {
+  avgdata <- colwise(mean)(data)
+  avgdata <- 
+    cbind(avgdata[rep(seq_len(nrow(avgdata)),length(metrics)),], seqnum = seq(1:length(metrics))) %>% melt("seqnum")
+  
+  metrics <- data.frame(cbind(metrics, seqnum = seq(1:length(metrics))))
+  
+  avgdata[avgdata$variable %in% metrics$metrics,]$value <- 0
+  
+  avgdata <-
+    ddply(metrics, 1, function(metrics) {
+      
+      avgdata[avgdata$seqnum == as.numeric(metrics$seqnum) & avgdata$variable == as.character(metrics$metrics),]$value <- 
+        avgdata[avgdata$seqnum == as.numeric(metrics$seqnum) & avgdata$variable == as.character(metrics$metrics),]$value + value
+      
+      return(avgdata)
+    })
+  
+  avgdata <- 
+    avgdata[,2:4] %>%
+    dcast(., seqnum~variable, fun = mean)
+  
+  fit <- survfit(model, newdata = avgdata[2:ncol(avgdata)])
+  
+  plot.data <-
+    data.frame(cbind(time = fit[[2]], survivalrate = fit[[6]]))
+  
+  names(plot.data)[1:nrow(metrics) + 1] <- paste(value, metrics$metrics, sep = " ")
+  
+  plot.data <- 
+    plot.data %>% melt("time") %>% dcast(time~variable)
+  
+  return(plot.data)
+  
+}
+```
+
+<br>
+```{r, fig.width = 10, fig.height= 5, dpi = 144}
+compareVarSurvData(model1, cleandata[,1:22], c("nearby_pageView", "mall_pageView","jfy_pageView","category_pageView"),1) %>% melt("time") %>% 
+  ggplot(aes(x = time, y = value, colour = variable)) + geom_line(size = .8) + theme_bw() +
+  scale_y_continuous(labels = percent, name = "Survival Probability") + scale_x_continuous(name = "Days after First Launch") +
+  scale_colour_discrete(name = "Number actions in first 28 days") 
+```
+
+<br>
+For the particular variables we chose, we can see that the subsequent effects on the surival curve is very similar.  However, we can also see that having one pageview to the mall page has the most positive impact on survivability.
+
+                      
+                      
