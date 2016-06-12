@@ -148,7 +148,7 @@ colnames(cleandata)
 Our final dataframe will have all the covariates that we want to use in the model, in addition to the lapsed and intervalend variables.
 
 <br>
-All of this work so far was into cleaning our dataset in prepartion for the modeling.  Next, we can actually estimate our native app survival curves and also the proportional effect of our covariates on the hazard ratio.  For those familiar with regression modeling in R, the **Cox-Proportional Hazards** model is specified in a very similar fashion.  The only difference is that, whereas in a typical regression model the response variable only takes in one column name as a paramter, the CoxPH model takes in a **Surv** object.  A **Surv** object is defined by two parameters: first the interval variable, and then the event variable.  The independent variables are specified in the exact same fashion.
+All of this work so far was into cleaning our dataset in preparation for the modeling.  Next, we can actually estimate our native app survival curves and also the proportional effect of our covariates on the hazard ratio.  For those familiar with regression modeling in R, the **Cox-Proportional Hazards** model is specified in a very similar fashion.  The only difference is that, whereas in a typical regression model the response variable only takes in one column name as a paramter, the CoxPH model takes in a **Surv** object.  A **Surv** object is defined by two parameters: first the interval variable, and then the event variable.  The independent variables are specified in the exact same fashion.
 
 ```{r}
 model1 <- coxph(Surv(cleandata$intervalend, cleandata$lapsed) ~ .,
