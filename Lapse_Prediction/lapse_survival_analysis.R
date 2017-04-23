@@ -14,7 +14,6 @@ source("lapse_survival_functions.R")
 
 drv <- dbDriver("PostgreSQL")
 
-redshift = dbConnect(drv,host = 'rsh-rpt-se1-dat-rdb-mem-prd.c2vtvr6b5gso.us-east-1.redshift.amazonaws.com', dbname = 'members',user = "rmn_jjea", password = "182493Superman.",port='5439')
 
 lapse.data <-
 dbGetQuery(redshift,
