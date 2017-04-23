@@ -42,8 +42,6 @@ In this case, my dataset is a table of app users with their first visit date, th
 
 ```{r, echo=FALSE, include=FALSE, cache=FALSE}
 drv <- dbDriver("PostgreSQL")
-
-redshift = dbConnect(drv,host = 'rsh-rpt-se1-dat-rdb-mem-prd.c2vtvr6b5gso.us-east-1.redshift.amazonaws.com', dbname = 'members',user = "rmn_jjea", password = "182493Superman.",port='5439')
 ```
 
 ```{r}
